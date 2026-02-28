@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from dotenv import load_dotenv
+from docx import Document
+from docx.shared import Pt
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -26,9 +28,6 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-
-from docx import Document
-from docx.shared import Pt
 
 from db import DB
 from ydisk import YDisk, sanitize_name
@@ -56,7 +55,7 @@ db = DB(DB_PATH)
 yd = YDisk(YANDEX_TOKEN)
 router = Router()
 
-# короткий токен -> путь на диске
+# короткий токен -> путь на диске (для инлайн-скачивания)
 COMMON_DL_MAP: dict[str, str] = {}
 SUB_DL_MAP: dict[str, str] = {}
 
@@ -100,6 +99,19 @@ def int_pos(s: str) -> Optional[int]:
     return n if n > 0 else None
 
 
+PHONE_RE = re.compile(r"^[\d\+\-\(\) ]{6,}$")
+
+
+def norm_phone(s: str) -> Optional[str]:
+    s = (s or "").strip()
+    if not s:
+        return None
+    if not PHONE_RE.match(s):
+        return None
+    # минимальная нормализация
+    return re.sub(r"\s+", " ", s)
+
+
 def folder_for(event_date: str, org: str, event_title: str) -> str:
     # Фестиваль/дата-название организации-название мероприятия
     return f"{YANDEX_ROOT}/{sanitize_name(event_date)}-{sanitize_name(org)}-{sanitize_name(event_title)}"
@@ -117,6 +129,7 @@ SURVEY_OPTIONS: Dict[str, List[str]] = {
     "power_type": ["Нет", "63А - 5 Pin", "32A - 5 Pin", "32A - 3 Pin"],  # мультивыбор
     "power_where": ["Левая сторона", "Арьер", "Правая сторона", "Авансцена"],
     "dimmer_needed": ["Да", "Нет"],
+    "sfx": ["Нет", "Дым или туман", "Мыльные пузыри", "Снег", "Пиротехника", "Другое"],  # мультивыбор
     "operator": ["Ваш оператор", "Оператор Мастерской «12»"],
     "console_help": ["Да", "Нет", "Привезем свой пульт"],
     "confirm": ["✅ Сохранить", "🔁 Заново"],
@@ -160,6 +173,23 @@ def kb_power_types_multi(selected: List[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def kb_sfx_multi(selected: List[str]) -> InlineKeyboardMarkup:
+    opts = SURVEY_OPTIONS["sfx"]
+    rows: List[List[InlineKeyboardButton]] = []
+
+    text_none = "❌ Нет" if not selected else "Нет"
+    rows.append([InlineKeyboardButton(text=text_none, callback_data="sx:none")])
+
+    for i, opt in enumerate(opts):
+        if opt == "Нет":
+            continue
+        mark = "✅ " if opt in selected else "☑️ "
+        rows.append([InlineKeyboardButton(text=f"{mark}{opt}", callback_data=f"sx:opt:{i}")])
+
+    rows.append([InlineKeyboardButton(text="➡️ Далее", callback_data="sx:done")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def kb_survey_reply() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="⏸ Прервать и доделать позже")]],
@@ -190,23 +220,28 @@ def kb_admin_menu() -> ReplyKeyboardMarkup:
 
 
 def answers_text(a: Dict[str, Any]) -> str:
+    def fmt_list(xs: List[str]) -> str:
+        if not xs:
+            return "—"
+        return "\n" + "\n".join([f"  - {x}" for x in xs])
+
     def g(k: str) -> str:
         v = a.get(k)
         if v is None or v == "" or v == []:
             return "—"
         if isinstance(v, list):
-            return "\n" + "\n".join([f"  - {x}" for x in v])
+            return fmt_list([str(x) for x in v])
         return str(v)
 
+    # ---- Power preview (draft + saved) ----
     power_where = a.get("power_where_list") or []
     power_type = str(a.get("power_type") or "").strip()
 
-    # draft preview: derive power info from power_items/power_types
     power_items = a.get("power_items") or []
     power_types = a.get("power_types") or []
 
     if (not power_where) and power_items:
-        flat = []
+        flat: List[str] = []
         for it in power_items:
             t = (it or {}).get("type")
             for w in ((it or {}).get("where") or []):
@@ -225,13 +260,27 @@ def answers_text(a: Dict[str, Any]) -> str:
         power_needed = "Нет"
     if str(power_type).strip() == "Нет":
         power_needed = "Нет"
-
-    # if types selected but placements not filled yet, still show power is needed
     if power_needed == "Нет" and (power_types or power_items):
         power_needed = "Да"
 
+    # ---- Dimmer ----
     dimmer_needed = str(a.get("dimmer_needed") or "—").strip()
 
+    # ---- SFX ----
+    sfx_list = a.get("sfx_list")
+    if sfx_list is None:
+        try:
+            sfx_list = json.loads(a.get("sfx_json") or "[]")
+        except Exception:
+            sfx_list = []
+    if not isinstance(sfx_list, list):
+        sfx_list = []
+    sfx_other = str(a.get("sfx_other") or "").strip()
+    if sfx_other and ("Другое" in sfx_list):
+        sfx_list = [x if x != "Другое" else f"Другое: {sfx_other}" for x in sfx_list]
+    a["sfx_list"] = sfx_list
+
+    # ---- Console ----
     operator = str(a.get("operator") or "—").strip()
     console_help = str(a.get("console_help") or "—").strip()
     scene = str(a.get("scene") or "").strip()
@@ -248,6 +297,7 @@ def answers_text(a: Dict[str, Any]) -> str:
         f"1) Организация: {g('org')}",
         f"2) Должность: {g('role')}",
         f"3) Имя: {g('name')}",
+        f"3.1) Телефон: {g('phone')}",
         f"4) Дата: {g('event_date')}",
         f"4.1) Название мероприятия: {g('event_title')}",
         f"4.5) Сцена: {g('scene')}",
@@ -257,12 +307,14 @@ def answers_text(a: Dict[str, Any]) -> str:
         f"8) Доп. оборудование: {g('extra_equipment')}",
         f"9) Вилки: {g('plugs')}",
         f"10) Силовые: {power_needed}",
-        f"12) Где силовые: {('—' if not power_where else ('\n' + '\n'.join([f'  - {x}' for x in power_where])))}",
+        f"12) Где силовые: {fmt_list(power_where) if power_where else '—'}",
         f"13) Диммер: {dimmer_needed}",
     ]
 
     if dimmer_needed == "Да":
         lines.append(f"14) Диммер текст: {g('dimmer_text')}")
+
+    lines.append(f"14.5) Спецэффекты: {g('sfx_list')}")
 
     lines.extend(
         [
@@ -279,6 +331,7 @@ EDIT_FIELDS = [
     ("org", "Организация"),
     ("role", "Должность"),
     ("name", "Имя"),
+    ("phone", "Телефон"),
     ("event_date", "Дата (ДД.ММ.ГГГГ)"),
     ("event_title", "Название мероприятия"),
     ("scene", "Сцена"),
@@ -331,14 +384,22 @@ class Survey(StatesGroup):
     techs_count = State()
     extra_equipment = State()
     plugs = State()
+
     power_type = State()
     power_count = State()
     power_where = State()
+
     dimmer_needed = State()
     dimmer_text = State()
+
+    sfx = State()
+    sfx_other = State()
+
     operator = State()
     console_help = State()
     console_model = State()
+
+    phone = State()
     confirm = State()
 
 
@@ -383,38 +444,32 @@ async def draft_set(state: FSMContext, patch: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
-def submission_to_dict(row: Any) -> Dict[str, Any]:
-    power_where_list = json.loads(row["power_where_json"] or "[]")
-
-    power_json = None
+def _safe_row_get(row: Any, key: str, default: Any = None) -> Any:
     try:
-        if "power_json" in row.keys():
-            power_json = row["power_json"]
+        if hasattr(row, "keys") and key in row.keys():
+            return row[key]
     except Exception:
-        power_json = None
+        pass
+    return default
 
-    if power_json:
-        try:
-            items = json.loads(power_json) or []
-        except Exception:
-            items = []
-        if items:
-            power_type = ", ".join([x.get("type") for x in items if x.get("type")])
-            flat = []
-            for it in items:
-                t = it.get("type")
-                for w in (it.get("where") or []):
-                    flat.append(f"{t}: {w}")
-            power_where_list = flat
-        else:
-            power_type = row["power_type"] or "Нет"
-    else:
-        power_type = row["power_type"] or "Нет"
+
+def submission_to_dict(row: Any) -> Dict[str, Any]:
+    power_where_list = json.loads(_safe_row_get(row, "power_where_json", "[]") or "[]")
+
+    sfx_json = _safe_row_get(row, "sfx_json", "[]") or "[]"
+    try:
+        sfx_list = json.loads(sfx_json)
+    except Exception:
+        sfx_list = []
+    if not isinstance(sfx_list, list):
+        sfx_list = []
+    sfx_other = _safe_row_get(row, "sfx_other", "") or ""
 
     return {
         "org": row["org"],
         "role": row["role"],
         "name": row["name"],
+        "phone": _safe_row_get(row, "phone", "") or "",
         "event_date": row["event_date"],
         "event_title": row["event_title"],
         "scene": row["scene"],
@@ -423,10 +478,13 @@ def submission_to_dict(row: Any) -> Dict[str, Any]:
         "techs_count": row["techs_count"],
         "extra_equipment": row["extra_equipment"],
         "plugs": row["plugs"],
-        "power_type": power_type,
+        "power_type": (row["power_type"] or "Нет"),
         "power_where_list": power_where_list,
         "dimmer_needed": row["dimmer_needed"],
         "dimmer_text": row["dimmer_text"],
+        "sfx_json": sfx_json,
+        "sfx_other": sfx_other,
+        "sfx_list": sfx_list,
         "operator": row["operator"],
         "console_help": row["console_help"],
         "console_model": row["console_model"],
@@ -450,19 +508,6 @@ def build_docx_for_submission(sub: Any) -> bytes:
     d.add_paragraph(f"Сцена: {sub['scene']}")
     d.add_paragraph("")
 
-    # power list
-    try:
-        items = json.loads(sub.get("power_json") or "[]")
-    except Exception:
-        items = []
-    power_where_list = json.loads(sub.get("power_where_json") or "[]")
-    if items:
-        power_where_list = []
-        for it in items:
-            t = it.get("type")
-            for w in (it.get("where") or []):
-                power_where_list.append(f"{t}: {w}")
-
     table = d.add_table(rows=1, cols=2)
     hdr = table.rows[0].cells
     hdr[0].text = "Вопрос"
@@ -471,11 +516,12 @@ def build_docx_for_submission(sub: Any) -> bytes:
     def add(q: str, a: str):
         row = table.add_row().cells
         row[0].text = q
-        row[1].text = a if (a and a.strip()) else "—"
+        row[1].text = a if (a and str(a).strip()) else "—"
 
     add("1. Организация", sub["org"])
     add("2. Должность", sub["role"])
     add("3. Имя", sub["name"])
+    add("3.1. Телефон", sub.get("phone", "") or "—")
     add("4. Дата проведения", sub["event_date"])
     add("4.1. Название мероприятия", sub["event_title"])
     add("4.5. Сцена", sub["scene"])
@@ -485,20 +531,30 @@ def build_docx_for_submission(sub: Any) -> bytes:
     add("8. Доп. оборудование", sub["extra_equipment"])
     add("9. Вилки", sub["plugs"])
 
-    # 10 yes/no
+    power_where_list = json.loads(sub.get("power_where_json") or "[]")
     power_type = str(sub.get("power_type") or "").strip()
     power_needed = "Да"
     if (not power_where_list) and (power_type in {"", "—", "Нет", "0"}):
         power_needed = "Нет"
     if power_type == "Нет":
         power_needed = "Нет"
-
     add("10. Силовые подключения", power_needed)
     add("12. Где подключения", "\n".join(power_where_list) if power_where_list else "—")
 
     add("13. Диммерные включения", sub["dimmer_needed"])
     if str(sub["dimmer_needed"]).strip() == "Да":
         add("14. Диммеры (текст)", sub["dimmer_text"])
+
+    try:
+        sfx_list = json.loads(sub.get("sfx_json") or "[]")
+    except Exception:
+        sfx_list = []
+    if not isinstance(sfx_list, list):
+        sfx_list = []
+    sfx_other = str(sub.get("sfx_other") or "").strip()
+    if sfx_other and ("Другое" in sfx_list):
+        sfx_list = [x if x != "Другое" else f"Другое: {sfx_other}" for x in sfx_list]
+    add("14.5. Спецэффекты", "\n".join(sfx_list) if sfx_list else "Нет")
 
     add("15. Кто ведёт", sub["operator"])
     add("16. Помощь с пультом", sub["console_help"])
@@ -567,7 +623,7 @@ async def m_survey(message: Message, state: FSMContext):
         return
 
     await state.clear()
-    await draft_set(state, {"power_types": [], "power_items": [], "power_i": 0})
+    await draft_set(state, {"power_types": [], "power_items": [], "power_i": 0, "sfx_list": [], "sfx_other": ""})
     await state.set_state(Survey.org)
     await message.answer("1) Как называется ваша организация? (текст)", reply_markup=kb_survey_reply())
 
@@ -576,7 +632,7 @@ async def m_survey(message: Message, state: FSMContext):
 async def m_new(message: Message, state: FSMContext):
     db.delete_draft(message.from_user.id)
     await state.clear()
-    await draft_set(state, {"power_types": [], "power_items": [], "power_i": 0})
+    await draft_set(state, {"power_types": [], "power_items": [], "power_i": 0, "sfx_list": [], "sfx_other": ""})
     await state.set_state(Survey.org)
     await message.answer("1) Как называется ваша организация? (текст)", reply_markup=kb_survey_reply())
 
@@ -592,14 +648,13 @@ async def m_resume(message: Message, state: FSMContext):
     try:
         d = json.loads(row["draft_json"])
     except Exception:
-        d = {"power_types": [], "power_items": [], "power_i": 0}
+        d = {"power_types": [], "power_items": [], "power_i": 0, "sfx_list": [], "sfx_other": ""}
 
     await state.update_data(draft=d)
     await state.set_state(row["fsm_state"])
     st = row["fsm_state"]
     d2 = await draft_get(state)
 
-    # показать текущий вопрос заново
     if st == Survey.org.state:
         return await message.answer("1) Как называется ваша организация? (текст)", reply_markup=kb_survey_reply())
     if st == Survey.role.state:
@@ -651,6 +706,11 @@ async def m_resume(message: Message, state: FSMContext):
         return await message.answer("13) Нужны ли Вам диммерные включения?", reply_markup=kb_inline("dimmer_needed", 2))
     if st == Survey.dimmer_text.state:
         return await message.answer("14) Сколько и где нужны диммерные включения? (текст)", reply_markup=kb_survey_reply())
+    if st == Survey.sfx.state:
+        sel = d2.get("sfx_list") or []
+        return await message.answer("14.5) Спецэффекты? Можно выбрать несколько.", reply_markup=kb_sfx_multi(sel))
+    if st == Survey.sfx_other.state:
+        return await message.answer("Напишите свой вариант спецэффектов:", reply_markup=kb_survey_reply())
     if st == Survey.operator.state:
         return await message.answer("15) Кто будет вести мероприятие?", reply_markup=kb_inline("operator", 1))
     if st == Survey.console_help.state:
@@ -661,6 +721,8 @@ async def m_resume(message: Message, state: FSMContext):
         )
     if st == Survey.console_model.state:
         return await message.answer("17) Напишите марку и модель Вашего пульта. (текст)", reply_markup=kb_survey_reply())
+    if st == Survey.phone.state:
+        return await message.answer("18) Номер телефона для связи? (текст)", reply_markup=kb_survey_reply())
     if st == Survey.confirm.state:
         return await message.answer("Проверьте:\n\n" + answers_text(d2), reply_markup=kb_inline("confirm", 2))
 
@@ -848,13 +910,16 @@ async def edit_pick(message: Message, state: FSMContext):
             await message.answer("Меню:", reply_markup=kb_menu(message.from_user.id))
             return
 
-        try:
-            items = json.loads(row.get("power_json") or "[]")
-        except Exception:
-            items = []
+        power_where_list = json.loads((row["power_where_json"] or "[]"))
+        items_map: Dict[str, List[str]] = {}
+        for s in power_where_list:
+            if isinstance(s, str) and ": " in s:
+                t, w = s.split(": ", 1)
+                items_map.setdefault(t, []).append(w)
+        power_types = list(items_map.keys())
+        power_items = [{"type": t, "count": len(ws), "where": list(ws)} for t, ws in items_map.items()]
 
-        power_types = [it.get("type") for it in items if it.get("type")] if items else []
-        await state.update_data(draft={"power_types": power_types, "power_items": items, "power_i": 0})
+        await state.update_data(draft={"power_types": power_types, "power_items": power_items, "power_i": 0})
         await state.set_state(EditPower.power_type)
         await message.answer(
             "10) Нужны ли Вам дополнительные силовые подключения? Можно выбрать несколько.",
@@ -873,6 +938,8 @@ async def edit_pick(message: Message, state: FSMContext):
     hint = "Введите новое значение"
     if field == "event_date":
         hint += " (ДД.ММ.ГГГГ)"
+    if field == "phone":
+        hint += " (например: +7 999 123-45-67)"
     await message.answer(hint, reply_markup=ReplyKeyboardRemove())
 
 
@@ -913,6 +980,13 @@ async def edit_value(message: Message, state: FSMContext):
             return
         txt = str(n)
 
+    if field == "phone":
+        ph = norm_phone(txt)
+        if not ph:
+            await message.answer("Введите телефон (например: +7 999 123-45-67)")
+            return
+        txt = ph
+
     patch[field] = txt
 
     if field == "extra_equipment" and txt == "Нет":
@@ -925,7 +999,6 @@ async def edit_value(message: Message, state: FSMContext):
     if field == "console_help" and txt != "Привезем свой пульт":
         patch["console_model"] = "—"
 
-    # если меняем то, что влияет на папку — пересоздаем папку (без переноса файлов)
     if field in {"org", "event_date", "event_title"}:
         row = db.get_submission(int(sub_id))
         if row:
@@ -1033,16 +1106,35 @@ async def s_power_count(message: Message, state: FSMContext):
 @router.message(Survey.dimmer_text)
 async def s_dimmer_text(message: Message, state: FSMContext):
     await draft_set(state, {"dimmer_text": (message.text or "").strip()})
+    await state.set_state(Survey.sfx)
+    sel = (await draft_get(state)).get("sfx_list") or []
+    await message.answer("14.5) Спецэффекты? Можно выбрать несколько.", reply_markup=kb_sfx_multi(sel))
+
+
+@router.message(Survey.sfx_other)
+async def s_sfx_other(message: Message, state: FSMContext):
+    await draft_set(state, {"sfx_other": (message.text or "").strip()})
     await state.set_state(Survey.operator)
     await message.answer("15) Кто будет вести мероприятие?", reply_markup=kb_inline("operator", 1))
+
+
+@router.message(Survey.phone)
+async def s_phone(message: Message, state: FSMContext):
+    ph = norm_phone(message.text)
+    if not ph:
+        await message.answer("Введите телефон (например: +7 999 123-45-67)", reply_markup=kb_survey_reply())
+        return
+    await draft_set(state, {"phone": ph})
+    await state.set_state(Survey.confirm)
+    d2 = await draft_get(state)
+    await message.answer("Проверьте:\n\n" + answers_text(d2), reply_markup=kb_inline("confirm", 2))
 
 
 @router.message(Survey.console_model)
 async def s_console_model(message: Message, state: FSMContext):
     await draft_set(state, {"console_model": (message.text or "").strip()})
-    await state.set_state(Survey.confirm)
-    d2 = await draft_get(state)
-    await message.answer("Проверьте:\n\n" + answers_text(d2), reply_markup=kb_inline("confirm", 2))
+    await state.set_state(Survey.phone)
+    await message.answer("18) Номер телефона для связи? (текст)", reply_markup=kb_survey_reply())
 
 
 # ---------------- EditPower: count ----------------
@@ -1090,15 +1182,14 @@ async def power_types_cb(call: CallbackQuery, state: FSMContext):
         return
 
     if call.data == "pt:done":
-        # Always save the selected types to draft for consistency
         await draft_set(state, {"power_types": sel})
+
         if not sel:
+            await draft_set(state, {"power_items": [], "power_i": 0})
             if st == EditPower.power_type.state:
-                await draft_set(state, {"power_items": [], "power_i": 0})
                 await state.set_state(EditPower.confirm)
                 await call.message.answer("Силовые подключения: Нет. Сохранить?", reply_markup=kb_inline("confirm", 2))
             else:
-                await draft_set(state, {"power_items": [], "power_i": 0})
                 await state.set_state(Survey.dimmer_needed)
                 await call.message.answer("13) Нужны ли Вам диммерные включения?", reply_markup=kb_inline("dimmer_needed", 2))
             await call.answer()
@@ -1129,6 +1220,63 @@ async def power_types_cb(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+@router.callback_query(F.data.startswith("sx:"))
+async def sfx_cb(call: CallbackQuery, state: FSMContext):
+    st = await state.get_state()
+    if st != Survey.sfx.state:
+        await call.answer()
+        return
+
+    d = await draft_get(state)
+    sel: List[str] = list(d.get("sfx_list") or [])
+    opts = SURVEY_OPTIONS["sfx"]
+
+    if call.data == "sx:none":
+        sel = []
+        await draft_set(state, {"sfx_list": sel, "sfx_other": ""})
+        await call.message.edit_reply_markup(reply_markup=kb_sfx_multi(sel))
+        await call.answer()
+        return
+
+    if call.data == "sx:done":
+        await draft_set(state, {"sfx_list": sel})
+        if not sel:
+            await draft_set(state, {"sfx_list": [], "sfx_other": ""})
+            await state.set_state(Survey.operator)
+            await call.message.answer("15) Кто будет вести мероприятие?", reply_markup=kb_inline("operator", 1))
+            await call.answer()
+            return
+
+        if "Другое" in sel:
+            await state.set_state(Survey.sfx_other)
+            await call.message.answer("Напишите свой вариант спецэффектов:", reply_markup=kb_survey_reply())
+            await call.answer()
+            return
+
+        await draft_set(state, {"sfx_other": ""})
+        await state.set_state(Survey.operator)
+        await call.message.answer("15) Кто будет вести мероприятие?", reply_markup=kb_inline("operator", 1))
+        await call.answer()
+        return
+
+    m = re.match(r"^sx:opt:(\d+)$", call.data)
+    if m:
+        idx = int(m.group(1))
+        if 0 <= idx < len(opts):
+            val = opts[idx]
+            if val != "Нет":
+                if val in sel:
+                    sel.remove(val)
+                else:
+                    sel.append(val)
+        await draft_set(state, {"sfx_list": sel})
+        await call.message.edit_reply_markup(reply_markup=kb_sfx_multi(sel))
+        await call.answer()
+        return
+
+    await call.answer()
+
+
 @router.callback_query(F.data.startswith("ans:"))
 async def s_inline(call: CallbackQuery, state: FSMContext):
     _, field, idx_s = call.data.split(":", 2)
@@ -1144,28 +1292,24 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
     except Exception:
         return await call.answer()
 
-    # сцена
     if field == "scene" and st == Survey.scene.state:
         await draft_set(state, {"scene": value})
         await state.set_state(Survey.night_mount)
         await call.message.answer("5) Нужен ли Вам ночной монтаж перед мероприятием?", reply_markup=kb_inline("night_mount", 2))
         return await call.answer()
 
-    # ночной монтаж
     if field == "night_mount" and st == Survey.night_mount.state:
         await draft_set(state, {"night_mount": value})
         await state.set_state(Survey.mount_who)
         await call.message.answer("6) Кто производит монтаж световой аппаратуры?", reply_markup=kb_inline("mount_who", 1))
         return await call.answer()
 
-    # кто монтирует
     if field == "mount_who" and st == Survey.mount_who.state:
         await draft_set(state, {"mount_who": value})
         await state.set_state(Survey.techs_count)
         await call.message.answer("7) Сколько техников на монтаж Вам понадобится? (число)", reply_markup=kb_survey_reply())
         return await call.answer()
 
-    # доп оборудование
     if field == "extra_equipment" and st == Survey.extra_equipment.state:
         await draft_set(state, {"extra_equipment": value})
         if value == "Нет":
@@ -1181,7 +1325,6 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
             await call.message.answer("9) Какие вилки на Ваших приборах? (текст)", reply_markup=kb_survey_reply())
         return await call.answer()
 
-    # where for power (survey + editpower)
     if field == "power_where" and st in {Survey.power_where.state, EditPower.power_where.state}:
         items = d.get("power_items") or []
         i = int(d.get("power_i") or 0)
@@ -1189,7 +1332,7 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
         if i >= len(items):
             if st == EditPower.power_where.state:
                 await state.set_state(EditPower.confirm)
-                await call.message.answer("Силовые подключения: Нет. Сохранить?", reply_markup=kb_inline("confirm", 2))
+                await call.message.answer("Сохранить изменения силовых?", reply_markup=kb_inline("confirm", 2))
             else:
                 await state.set_state(Survey.dimmer_needed)
                 await call.message.answer("13) Нужны ли Вам диммерные включения?", reply_markup=kb_inline("dimmer_needed", 2))
@@ -1213,7 +1356,6 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
             )
             return await call.answer()
 
-        # следующий тип
         i += 1
         if i < len(items):
             await draft_set(state, {"power_i": i})
@@ -1221,7 +1363,6 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
             await call.message.answer(f"11) Сколько подключений нужно для «{items[i]['type']}»? (число)", reply_markup=kb_survey_reply())
             return await call.answer()
 
-        # закончили силовые
         if st == EditPower.power_where.state:
             await state.set_state(EditPower.confirm)
             parts = []
@@ -1233,26 +1374,24 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
             await call.message.answer("13) Нужны ли Вам диммерные включения?", reply_markup=kb_inline("dimmer_needed", 2))
         return await call.answer()
 
-    # диммер да/нет
     if field == "dimmer_needed" and st == Survey.dimmer_needed.state:
         await draft_set(state, {"dimmer_needed": value})
         if value == "Нет":
             await draft_set(state, {"dimmer_text": "—"})
-            await state.set_state(Survey.operator)
-            await call.message.answer("15) Кто будет вести мероприятие?", reply_markup=kb_inline("operator", 1))
+            await state.set_state(Survey.sfx)
+            sel = (await draft_get(state)).get("sfx_list") or []
+            await call.message.answer("14.5) Спецэффекты? Можно выбрать несколько.", reply_markup=kb_sfx_multi(sel))
         else:
             await state.set_state(Survey.dimmer_text)
             await call.message.answer("14) Сколько и где нужны диммерные включения? (текст)", reply_markup=kb_survey_reply())
         return await call.answer()
 
-    # оператор
     if field == "operator" and st == Survey.operator.state:
         await draft_set(state, {"operator": value})
         if value.startswith("Оператор"):
             await draft_set(state, {"console_help": "—", "console_model": "—"})
-            await state.set_state(Survey.confirm)
-            d2 = await draft_get(state)
-            await call.message.answer("Проверьте:\n\n" + answers_text(d2), reply_markup=kb_inline("confirm", 2))
+            await state.set_state(Survey.phone)
+            await call.message.answer("18) Номер телефона для связи? (текст)", reply_markup=kb_survey_reply())
         else:
             await state.set_state(Survey.console_help)
             d2 = await draft_get(state)
@@ -1263,7 +1402,6 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
             )
         return await call.answer()
 
-    # помощь с пультом
     if field == "console_help" and st == Survey.console_help.state:
         await draft_set(state, {"console_help": value})
         if value == "Привезем свой пульт":
@@ -1271,12 +1409,10 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
             await call.message.answer("17) Напишите марку и модель Вашего пульта. (текст)", reply_markup=kb_survey_reply())
         else:
             await draft_set(state, {"console_model": "—"})
-            await state.set_state(Survey.confirm)
-            d2 = await draft_get(state)
-            await call.message.answer("Проверьте:\n\n" + answers_text(d2), reply_markup=kb_inline("confirm", 2))
+            await state.set_state(Survey.phone)
+            await call.message.answer("18) Номер телефона для связи? (текст)", reply_markup=kb_survey_reply())
         return await call.answer()
 
-    # confirm (survey save OR editpower save)
     if field == "confirm" and st in {Survey.confirm.state, EditPower.confirm.state}:
         if st == EditPower.confirm.state:
             if value.startswith("🔁"):
@@ -1288,19 +1424,19 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
             power_items = d2.get("power_items") or []
             power_types = d2.get("power_types") or []
 
-            # if user selected types but did not fill counts/where yet, keep the selection
             if not power_items and power_types:
                 power_items = [{"type": t, "count": 0, "where": []} for t in power_types]
-
-            power_json = json.dumps(power_items, ensure_ascii=False)
 
             if not power_items:
                 power_type = "Нет"
                 power_where_list = []
+                power_count_sum = 0
             else:
                 power_type = ", ".join([x.get("type") for x in power_items if x.get("type")])
                 power_where_list = []
+                power_count_sum = 0
                 for it in power_items:
+                    power_count_sum += int(it.get("count") or 0)
                     t = it.get("type")
                     for w in (it.get("where") or []):
                         power_where_list.append(f"{t}: {w}")
@@ -1318,8 +1454,8 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
                 int(sub_id),
                 {
                     "power_type": power_type,
+                    "power_count": str(power_count_sum),
                     "power_where_json": power_where_json,
-                    "power_json": power_json,
                 },
             )
 
@@ -1327,7 +1463,6 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
             await call.message.answer("✅ Силовые обновлены", reply_markup=kb_menu(call.from_user.id))
             return await call.answer()
 
-        # Survey.confirm
         if value.startswith("🔁"):
             db.delete_draft(call.from_user.id)
             await state.clear()
@@ -1341,34 +1476,42 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
         d2.setdefault("console_help", "—")
         d2.setdefault("console_model", "—")
         d2.setdefault("event_title", "Мероприятие")
+        d2.setdefault("sfx_list", [])
+        d2.setdefault("sfx_other", "")
+        d2.setdefault("phone", "")
 
         power_items = d2.get("power_items") or []
         power_types = d2.get("power_types") or []
-
-        # if user selected types but did not fill counts/where yet, keep the selection
         if not power_items and power_types:
             power_items = [{"type": t, "count": 0, "where": []} for t in power_types]
-
-        d2["power_json"] = json.dumps(power_items, ensure_ascii=False)
 
         if not power_items:
             d2["power_type"] = "Нет"
             power_where_list = []
+            power_count_sum = 0
         else:
             d2["power_type"] = ", ".join([x.get("type") for x in power_items if x.get("type")])
             power_where_list = []
+            power_count_sum = 0
             for it in power_items:
+                power_count_sum += int(it.get("count") or 0)
                 for w in (it.get("where") or []):
                     power_where_list.append(f"{it.get('type')}: {w}")
+
+        sfx_list = d2.get("sfx_list") or []
+        d2["sfx_json"] = json.dumps(sfx_list, ensure_ascii=False)
+        d2["sfx_other"] = str(d2.get("sfx_other") or "").strip()
 
         folder = folder_for(d2["event_date"], d2["org"], d2["event_title"])
         await yd.ensure_folder(f"{YANDEX_ROOT}")
         await yd.ensure_folder(folder)
 
         payload = dict(d2)
+        payload["power_count"] = str(power_count_sum)
         payload["power_where_json"] = json.dumps(power_where_list, ensure_ascii=False)
         payload["ydisk_folder"] = folder
-        payload["power_json"] = d2.get("power_json")
+        payload["sfx_json"] = d2["sfx_json"]
+        payload["sfx_other"] = d2["sfx_other"]
 
         sub_id = db.insert_submission(call.from_user.id, payload)
         db.upsert_user_last(call.from_user.id, sub_id, folder)
@@ -1382,8 +1525,20 @@ async def s_inline(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# --------- inline-only states: text fallback ----------
-@router.message(F.state.in_({Survey.scene, Survey.night_mount, Survey.mount_who, Survey.extra_equipment, Survey.dimmer_needed, Survey.operator, Survey.console_help}))
+@router.message(
+    F.state.in_(
+        {
+            Survey.scene,
+            Survey.night_mount,
+            Survey.mount_who,
+            Survey.extra_equipment,
+            Survey.dimmer_needed,
+            Survey.operator,
+            Survey.console_help,
+            Survey.sfx,
+        }
+    )
+)
 async def inline_only_text(message: Message):
     await message.answer("Выберите вариант кнопками выше.")
 
@@ -1502,8 +1657,6 @@ async def a_word_pick_form(message: Message, state: FSMContext):
         await message.answer("Не найдено.")
         return
 
-    # заполним console_model по правилам для Word
-    # если оператор мастерской — оставляем "—"
     if sub["operator"] != "Оператор Мастерской «12»":
         if sub["console_help"] == "Привезем свой пульт":
             sub["console_model"] = sub["console_model"] or "—"
@@ -1514,7 +1667,11 @@ async def a_word_pick_form(message: Message, state: FSMContext):
 
     data = build_docx_for_submission(sub)
     filename = f"анкета_{sub_id}_{sanitize_name(sub['event_date'])}_{sanitize_name(sub['org'])}_{sanitize_name(sub['event_title'])}.docx"
-    await message.answer_document(BufferedInputFile(data, filename=filename), caption=f"Анкета #{sub_id}", reply_markup=kb_admin_menu())
+    await message.answer_document(
+        BufferedInputFile(data, filename=filename),
+        caption=f"Анкета #{sub_id}",
+        reply_markup=kb_admin_menu(),
+    )
     await state.clear()
 
 
@@ -1610,7 +1767,6 @@ async def a_del_confirm(message: Message, state: FSMContext):
     sub = db.get_submission(sub_id)
     folder = sub["ydisk_folder"] if sub else None
 
-    # удалить папку анкеты при удалении анкеты
     if folder:
         try:
             await yd.delete(folder, permanently=False)

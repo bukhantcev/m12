@@ -43,6 +43,7 @@ class DB:
                     org TEXT NOT NULL,
                     role TEXT NOT NULL,
                     name TEXT NOT NULL,
+                    phone TEXT NOT NULL DEFAULT '',
 
                     event_date TEXT NOT NULL,
                     event_title TEXT NOT NULL DEFAULT '',
@@ -62,6 +63,9 @@ class DB:
 
                     dimmer_needed TEXT NOT NULL,
                     dimmer_text TEXT NOT NULL,
+
+                    sfx_json TEXT NOT NULL DEFAULT '[]',
+                    sfx_other TEXT NOT NULL DEFAULT '',
 
                     operator TEXT NOT NULL,
                     console_help TEXT NOT NULL,
@@ -101,6 +105,16 @@ class DB:
             # миграция старой БД: если нет event_title — добавим
             if not self._col_exists(con, "submissions", "event_title"):
                 con.execute("ALTER TABLE submissions ADD COLUMN event_title TEXT NOT NULL DEFAULT ''")
+
+            # миграция: телефон
+            if not self._col_exists(con, "submissions", "phone"):
+                con.execute("ALTER TABLE submissions ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
+
+            # миграция: спецэффекты
+            if not self._col_exists(con, "submissions", "sfx_json"):
+                con.execute("ALTER TABLE submissions ADD COLUMN sfx_json TEXT NOT NULL DEFAULT '[]'")
+            if not self._col_exists(con, "submissions", "sfx_other"):
+                con.execute("ALTER TABLE submissions ADD COLUMN sfx_other TEXT NOT NULL DEFAULT ''")
 
     # -------- users last --------
     def upsert_user_last(self, user_id: int, submission_id: Optional[int], folder_path: Optional[str]) -> None:
@@ -156,13 +170,14 @@ class DB:
     # -------- submissions --------
     def insert_submission(self, user_id: int, a: Dict[str, Any]) -> int:
         cols = [
-            "org", "role", "name",
+            "org", "role", "name", "phone",
             "event_date", "event_title",
             "scene",
             "night_mount", "mount_who", "techs_count",
             "extra_equipment", "plugs",
             "power_type", "power_count", "power_where_json",
             "dimmer_needed", "dimmer_text",
+            "sfx_json", "sfx_other",
             "operator", "console_help", "console_model",
             "ydisk_folder",
         ]
@@ -186,13 +201,14 @@ class DB:
             return False
 
         allowed = {
-            "org","role","name",
+            "org","role","name","phone",
             "event_date","event_title",
             "scene",
             "night_mount","mount_who","techs_count",
             "extra_equipment","plugs",
             "power_type","power_count","power_where_json",
             "dimmer_needed","dimmer_text",
+            "sfx_json","sfx_other",
             "operator","console_help","console_model",
             "ydisk_folder",
         }
